@@ -1,0 +1,423 @@
+// Copyright 1998-2018 Epic Games, Inc. All Rights Reserved.
+
+#include "DNEVTrackEditor.h"
+#include "Rendering/DrawElements.h"
+#include "Widgets/SBoxPanel.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "GameFramework/Actor.h"
+#include "Modules/ModuleManager.h"
+#include "Layout/WidgetPath.h"
+#include "Framework/Application/MenuStack.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/Layout/SBox.h"
+#include "SequencerSectionPainter.h"
+#include "Editor/UnrealEdEngine.h"
+#include "UnrealEdGlobals.h"
+#include "MovieSceneDNEVTrack.h"
+#include "MovieSceneDNEVSection.h"
+#include "CommonMovieSceneTools.h"
+#include "ContentBrowserModule.h"
+#include "SequencerUtilities.h"
+#include "ISectionLayoutBuilder.h"
+#include "EditorStyleSet.h"
+#include "MovieSceneTimeHelpers.h"
+#include "Fonts/FontMeasure.h"
+#include "SequencerTimeSliderController.h"
+#include "Misc/MessageDialog.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
+#include "DNEVMeshComponent.h"
+#include "DNEVModule.h"
+#include "Styling/SlateIconFinder.h"
+#include "LevelSequence.h"
+#include "TimeToPixel.h"
+
+namespace DNEVTrackEditorConstants
+{
+	// @todo Sequencer Allow this to be customizable
+	const uint32 AnimationTrackHeight = 20;
+}
+
+#define LOCTEXT_NAMESPACE "FDNEVTrackEditor"
+
+static UDNEVMeshComponent* AcquireDNEVCompFromObjectGuid(const FGuid& Guid, TSharedPtr<ISequencer> SequencerPtr)
+{
+	UObject* BoundObject = SequencerPtr.IsValid() ? SequencerPtr->FindSpawnedObjectOrTemplate(Guid) : nullptr;
+
+	if (AActor* Actor = Cast<AActor>(BoundObject))
+	{
+		for (UActorComponent* Component : Actor->GetComponents())
+		{
+			if (UDNEVMeshComponent* DNEVComp = Cast<UDNEVMeshComponent>(Component))
+			{
+				return DNEVComp;
+			}
+		}
+	}
+	else if (UDNEVMeshComponent* DNEVComp = Cast<UDNEVMeshComponent>(BoundObject))
+	{
+		return DNEVComp;
+	}
+
+	return nullptr;
+}
+
+
+FDNEVSection::FDNEVSection( UMovieSceneSection& InSection, TWeakPtr<ISequencer> InSequencer)
+	: Section(*CastChecked<UMovieSceneDNEVSection>(&InSection))
+	, Sequencer(InSequencer)
+	, InitialFirstLoopStartOffsetDuringResize(0)
+	, InitialStartTimeDuringResize(0)
+{ }
+
+
+UMovieSceneSection* FDNEVSection::GetSectionObject()
+{ 
+	return &Section;
+}
+
+
+FText FDNEVSection::GetSectionTitle() const
+{
+	return LOCTEXT("DNEVSection", "DNEV");
+}
+
+
+float FDNEVSection::GetSectionHeight() const
+{
+	return (float)DNEVTrackEditorConstants::AnimationTrackHeight;
+}
+
+
+int32 FDNEVSection::OnPaintSection( FSequencerSectionPainter& Painter ) const
+{
+	const ESlateDrawEffect DrawEffects = Painter.bParentEnabled ? ESlateDrawEffect::None : ESlateDrawEffect::DisabledEffect;
+	
+	const FTimeToPixel& TimeToPixelConverter = Painter.GetTimeConverter();
+
+	int32 LayerId = Painter.PaintSectionBackground();
+
+	static const FSlateBrush* GenericDivider = FEditorStyle::GetBrush("Sequencer.GenericDivider");
+
+	if (!Section.HasStartFrame() || !Section.HasEndFrame())
+	{
+		return LayerId;
+	}
+
+
+	FFrameRate TickResolution = TimeToPixelConverter.GetTickResolution();
+
+	// Add lines where the animation starts and ends/loops
+	const float AnimPlayRate = 1.0f;
+	const float Duration = Section.Params.GetSequenceLength();
+	const float SeqLength = Duration - TickResolution.AsSeconds(Section.Params.StartFrameOffset + Section.Params.EndFrameOffset) / AnimPlayRate;
+	const float FirstLoopSeqLength = SeqLength - TickResolution.AsSeconds(Section.Params.FirstLoopStartFrameOffset) / AnimPlayRate;
+
+	if (!FMath::IsNearlyZero(SeqLength, KINDA_SMALL_NUMBER) && SeqLength > 0)
+	{
+		float MaxOffset  = Section.GetRange().Size<FFrameTime>() / TickResolution;
+		float OffsetTime = FirstLoopSeqLength;
+		float StartTime  = Section.GetInclusiveStartFrame() / TickResolution;
+
+		while (OffsetTime < MaxOffset)
+		{
+			float OffsetPixel = TimeToPixelConverter.SecondsToPixel(StartTime + OffsetTime) - TimeToPixelConverter.SecondsToPixel(StartTime);
+
+			FSlateDrawElement::MakeBox(
+				Painter.DrawElements,
+				LayerId,
+				Painter.SectionGeometry.MakeChild(
+					FVector2D(2.f, Painter.SectionGeometry.Size.Y-2.f),
+					FSlateLayoutTransform(FVector2D(OffsetPixel, 1.f))
+				).ToPaintGeometry(),
+				GenericDivider,
+				DrawEffects
+			);
+
+			OffsetTime += SeqLength;
+		}
+	}
+	
+	TSharedPtr<ISequencer> SequencerPtr = Sequencer.Pin();
+	if (Painter.bIsSelected && SequencerPtr.IsValid())
+	{
+		FFrameTime CurrentTime = SequencerPtr->GetLocalTime().Time;
+
+		//if (Section.GetRange().Contains(CurrentTime.FrameNumber) && Section.Params.DNEVMeshComponent != nullptr)
+		//{
+		//	const float Time = TimeToPixelConverter.FrameToPixel(CurrentTime); 
+
+		//	UDNEVMeshComponent* DNEVMeshComponent = Section.Params.DNEVMeshComponent;
+
+		//	// Draw the current time next to the scrub handle
+		//	const float AnimTime = Section.MapTimeToAnimation(Duration, CurrentTime, TickResolution);
+		//	int32 FrameTime = DNEVMeshComponent->GetFrameAtTime(AnimTime);
+		//	FString FrameString = FString::FromInt(FrameTime);
+
+		//	const FSlateFontInfo SmallLayoutFont = FCoreStyle::GetDefaultFontStyle("Bold", 10);
+		//	const TSharedRef< FSlateFontMeasure > FontMeasureService = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
+		//	FVector2D TextSize = FontMeasureService->Measure(FrameString, SmallLayoutFont);
+
+		//	// Flip the text position if getting near the end of the view range
+		//	static const float TextOffsetPx = 10.f;
+		//	bool  bDrawLeft = (Painter.SectionGeometry.Size.X - Time) < (TextSize.X + 22.f) - TextOffsetPx;
+		//	float TextPosition = bDrawLeft ? Time - TextSize.X - TextOffsetPx : Time + TextOffsetPx;
+		//	//handle mirrored labels
+		//	const float MajorTickHeight = 9.0f; 
+		//	FVector2D TextOffset(TextPosition, Painter.SectionGeometry.Size.Y - (MajorTickHeight + TextSize.Y));
+
+		//	const FLinearColor DrawColor = FEditorStyle::GetSlateColor("SelectionColor").GetColor(FWidgetStyle());
+		//	const FVector2D BoxPadding = FVector2D(4.0f, 2.0f);
+		//	// draw time string
+	
+		//	FSlateDrawElement::MakeBox(
+		//		Painter.DrawElements,
+		//		LayerId + 5,
+		//		Painter.SectionGeometry.ToPaintGeometry(TextOffset - BoxPadding, TextSize + 2.0f * BoxPadding),
+		//		FEditorStyle::GetBrush("WhiteBrush"),
+		//		ESlateDrawEffect::None,
+		//		FLinearColor::Black.CopyWithNewOpacity(0.5f)
+		//	);
+
+		//	FSlateDrawElement::MakeText(
+		//		Painter.DrawElements,
+		//		LayerId + 6,
+		//		Painter.SectionGeometry.ToPaintGeometry(TextOffset, TextSize),
+		//		FrameString,
+		//		SmallLayoutFont,
+		//		DrawEffects,
+		//		DrawColor
+		//	);
+		//}
+	}
+	
+	return LayerId;
+}
+
+void FDNEVSection::BeginResizeSection()
+{
+	InitialFirstLoopStartOffsetDuringResize = Section.Params.FirstLoopStartFrameOffset;
+	InitialStartTimeDuringResize = Section.HasStartFrame() ? Section.GetInclusiveStartFrame() : 0;
+}
+
+void FDNEVSection::ResizeSection(ESequencerSectionResizeMode ResizeMode, FFrameNumber ResizeTime)
+{
+	// Adjust the start offset when resizing from the beginning
+	if (ResizeMode == SSRM_LeadingEdge)
+	{
+		FFrameRate FrameRate = Section.GetTypedOuter<UMovieScene>()->GetTickResolution();
+		FFrameNumber StartOffset = FrameRate.AsFrameNumber((ResizeTime - InitialStartTimeDuringResize) / FrameRate);
+
+		StartOffset += InitialFirstLoopStartOffsetDuringResize;
+
+		if (StartOffset < 0)
+		{
+			// Ensure start offset is not less than 0 and adjust ResizeTime
+			ResizeTime = ResizeTime - StartOffset;
+
+			StartOffset = FFrameNumber(0);
+		}
+		else
+		{
+			// If the start offset exceeds the length of one loop, trim it back.
+			const FFrameNumber SeqLength = FrameRate.AsFrameNumber(Section.Params.GetSequenceLength()) - Section.Params.StartFrameOffset - Section.Params.EndFrameOffset;
+			StartOffset = StartOffset % SeqLength;
+		}
+
+		Section.Params.FirstLoopStartFrameOffset = StartOffset;
+	}
+
+	ISequencerSection::ResizeSection(ResizeMode, ResizeTime);
+}
+
+void FDNEVSection::BeginSlipSection()
+{
+	BeginResizeSection();
+}
+
+void FDNEVSection::SlipSection(FFrameNumber SlipTime)
+{
+	FFrameRate FrameRate = Section.GetTypedOuter<UMovieScene>()->GetTickResolution();
+	FFrameNumber StartOffset = FrameRate.AsFrameNumber((SlipTime - InitialStartTimeDuringResize) / FrameRate);
+
+	StartOffset += InitialFirstLoopStartOffsetDuringResize;
+
+	if (StartOffset < 0)
+	{
+		// Ensure start offset is not less than 0 and adjust ResizeTime
+		SlipTime = SlipTime - StartOffset;
+
+		StartOffset = FFrameNumber(0);
+	}
+	else
+	{
+		// If the start offset exceeds the length of one loop, trim it back.
+		const FFrameNumber SeqLength = FrameRate.AsFrameNumber(Section.Params.GetSequenceLength()) - Section.Params.StartFrameOffset - Section.Params.EndFrameOffset;
+		StartOffset = StartOffset % SeqLength;
+	}
+
+	Section.Params.FirstLoopStartFrameOffset = StartOffset;
+
+	ISequencerSection::SlipSection(SlipTime);
+}
+
+void FDNEVSection::BeginDilateSection()
+{
+	//Section.PreviousPlayRate = Section.Params.PlayRate; //make sure to cache the play rate
+}
+void FDNEVSection::DilateSection(const TRange<FFrameNumber>& NewRange, float DilationFactor)
+{
+	//Section.Params.PlayRate = Section.PreviousPlayRate / DilationFactor;
+	Section.SetRange(NewRange);
+}
+
+FDNEVTrackEditor::FDNEVTrackEditor( TSharedRef<ISequencer> InSequencer )
+	: FMovieSceneTrackEditor( InSequencer ) 
+{ }
+
+
+TSharedRef<ISequencerTrackEditor> FDNEVTrackEditor::CreateTrackEditor( TSharedRef<ISequencer> InSequencer )
+{
+	return MakeShareable( new FDNEVTrackEditor( InSequencer ) );
+}
+
+bool FDNEVTrackEditor::SupportsSequence(UMovieSceneSequence* InSequence) const
+{
+	return InSequence && InSequence->IsA(ULevelSequence::StaticClass());
+}
+
+bool FDNEVTrackEditor::SupportsType( TSubclassOf<UMovieSceneTrack> Type ) const
+{
+	return Type == UMovieSceneDNEVTrack::StaticClass();
+}
+
+
+TSharedRef<ISequencerSection> FDNEVTrackEditor::MakeSectionInterface( UMovieSceneSection& SectionObject, UMovieSceneTrack& Track, FGuid ObjectBinding )
+{
+	check( SupportsType( SectionObject.GetOuter()->GetClass() ) );
+	
+	return MakeShareable( new FDNEVSection(SectionObject, GetSequencer()) );
+}
+
+void FDNEVTrackEditor::BuildObjectBindingTrackMenu(FMenuBuilder& MenuBuilder, const TArray<FGuid>& ObjectBindings, const UClass* ObjectClass)
+{
+	if (ObjectClass->IsChildOf(UDNEVMeshComponent::StaticClass()) || ObjectClass->IsChildOf(AActor::StaticClass()))
+	{
+		UDNEVMeshComponent* DNEVComp = AcquireDNEVCompFromObjectGuid(ObjectBindings[0], GetSequencer());
+
+		if (DNEVComp)
+		{
+			UMovieSceneTrack* Track = nullptr;
+
+			MenuBuilder.AddMenuEntry(
+				NSLOCTEXT("Sequencer", "AddDNEV", "DNEV"),
+				NSLOCTEXT("Sequencer", "AddDNEVTooltip", "Adds a DNEV track."),
+				FSlateIcon(),
+				FUIAction(
+					FExecuteAction::CreateSP(this, &FDNEVTrackEditor::BuildDNEVTrack, ObjectBindings, Track)
+				)
+			);
+		}
+	}
+}
+
+void FDNEVTrackEditor::BuildDNEVTrack(TArray<FGuid> ObjectBindings, UMovieSceneTrack* Track)
+{
+	TSharedPtr<ISequencer> SequencerPtr = GetSequencer();
+
+	if (SequencerPtr.IsValid())
+	{
+		const FScopedTransaction Transaction(LOCTEXT("AddDNEV_Transaction", "Add DNEV"));
+
+		for (FGuid ObjectBinding : ObjectBindings)
+		{
+			if (ObjectBinding.IsValid())
+			{
+				UObject* Object = SequencerPtr->FindSpawnedObjectOrTemplate(ObjectBinding);
+
+				UDNEVMeshComponent* GeomMeshComp = AcquireDNEVCompFromObjectGuid(ObjectBinding, GetSequencer());
+
+				if (Object && GeomMeshComp)
+				{
+					AnimatablePropertyChanged(FOnKeyProperty::CreateRaw(this, &FDNEVTrackEditor::AddKeyInternal, Object, GeomMeshComp, Track));
+				}
+			}
+		}
+	}
+}
+
+FKeyPropertyResult FDNEVTrackEditor::AddKeyInternal( FFrameNumber KeyTime, UObject* Object, UDNEVMeshComponent* DNEVComp, UMovieSceneTrack* Track)
+{
+	FKeyPropertyResult KeyPropertyResult;
+
+	FFindOrCreateHandleResult HandleResult = FindOrCreateHandleToObject( Object );
+	FGuid ObjectHandle = HandleResult.Handle;
+	KeyPropertyResult.bHandleCreated |= HandleResult.bWasCreated;
+	if (ObjectHandle.IsValid())
+	{
+		if (!Track)
+		{
+			Track = AddTrack(GetSequencer()->GetFocusedMovieSceneSequence()->GetMovieScene(), ObjectHandle, UMovieSceneDNEVTrack::StaticClass(), NAME_None);
+			KeyPropertyResult.bTrackCreated = true;
+		}
+
+		if (ensure(Track))
+		{
+			Track->Modify();
+
+			UMovieSceneSection* NewSection = Cast<UMovieSceneDNEVTrack>(Track)->AddNewAnimation( KeyTime, DNEVComp );
+			KeyPropertyResult.bTrackModified = true;
+			KeyPropertyResult.SectionsCreated.Add(NewSection);
+
+			GetSequencer()->EmptySelection();
+			GetSequencer()->SelectSection(NewSection);
+			GetSequencer()->ThrobSectionSelection();
+		}
+	}
+
+	return KeyPropertyResult;
+}
+
+
+TSharedPtr<SWidget> FDNEVTrackEditor::BuildOutlinerEditWidget(const FGuid& ObjectBinding, UMovieSceneTrack* Track, const FBuildEditWidgetParams& Params)
+{
+	UDNEVMeshComponent* DNEVComp = AcquireDNEVCompFromObjectGuid(ObjectBinding, GetSequencer());
+
+	if (DNEVComp)
+	{
+		TWeakPtr<ISequencer> WeakSequencer = GetSequencer();
+
+		auto SubMenuCallback = [=, this]() -> TSharedRef<SWidget>
+		{
+			FMenuBuilder MenuBuilder(true, nullptr);
+
+			TArray<FGuid> ObjectBindings;
+			ObjectBindings.Add(ObjectBinding);
+
+			BuildDNEVTrack(ObjectBindings, Track);
+			
+			return MenuBuilder.MakeWidget();
+		};
+
+		return SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				FSequencerUtilities::MakeAddButton(LOCTEXT("DNEVCompText", "DNEV"), FOnGetContent::CreateLambda(SubMenuCallback), Params.NodeIsHovered, GetSequencer())
+			];
+	}
+	else
+	{
+		return TSharedPtr<SWidget>();
+	}
+	
+}
+
+const FSlateBrush* FDNEVTrackEditor::GetIconBrush() const
+{
+	return FSlateIconFinder::FindIconForClass(UDNEVMeshComponent::StaticClass()).GetIcon();
+}
+
+
+#undef LOCTEXT_NAMESPACE
